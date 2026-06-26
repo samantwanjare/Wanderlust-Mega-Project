@@ -1,128 +1,144 @@
-@Library('Shared') _
 pipeline {
-    agent {label 'Node'}
-    
-    environment{
-        SONAR_HOME = tool "Sonar"
+    agent { label 'Node' }
+
+    environment {
+        AWS_REGION     = 'ap-south-1'
+        AWS_ACCOUNT_ID = '769265543964'
+
+        BACKEND_REPO  = 'wanderlust-backend'
+        FRONTEND_REPO = 'wanderlust-frontend'
     }
-    
+
     parameters {
-        string(name: 'FRONTEND_DOCKER_TAG', defaultValue: '', description: 'Setting docker image for latest push')
-        string(name: 'BACKEND_DOCKER_TAG', defaultValue: '', description: 'Setting docker image for latest push')
+        string(name: 'BACKEND_DOCKER_TAG', defaultValue: 'v1', description: 'Backend Docker Tag')
+        string(name: 'FRONTEND_DOCKER_TAG', defaultValue: 'v1', description: 'Frontend Docker Tag')
     }
-    
+
     stages {
-        stage("Validate Parameters") {
+
+        stage('Clean Workspace') {
             steps {
-                script {
-                    if (params.FRONTEND_DOCKER_TAG == '' || params.BACKEND_DOCKER_TAG == '') {
-                        error("FRONTEND_DOCKER_TAG and BACKEND_DOCKER_TAG must be provided.")
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/LondheShubham153/Wanderlust-Mega-Project.git'
+            }
+        }
+
+        stage('Verify Tools') {
+            steps {
+                sh '''
+                echo "Hostname: $(hostname)"
+                echo "User: $(whoami)"
+
+                java -version
+                git --version
+                docker --version
+                aws --version
+                trivy --version
+
+                docker images || true
+                '''
+            }
+        }
+
+        stage('Trivy File System Scan') {
+            steps {
+                sh 'trivy fs .'
+            }
+        }
+
+        stage('Environment Setup') {
+            parallel {
+
+                stage('Backend Setup') {
+                    steps {
+                        dir('Automations') {
+                            sh 'bash updatebackendnew.sh'
+                        }
                     }
                 }
-            }
-        }
-        stage("Workspace cleanup"){
-            steps{
-                script{
-                    cleanWs()
-                }
-            }
-        }
-        
-        stage('Git: Code Checkout') {
-            steps {
-                script{
-                    code_checkout("https://github.com/LondheShubham153/Wanderlust-Mega-Project.git","main")
-                }
-            }
-        }
-        
-        stage("Trivy: Filesystem scan"){
-            steps{
-                script{
-                    trivy_scan()
+
+                stage('Frontend Setup') {
+                    steps {
+                        dir('Automations') {
+                            sh 'bash updatefrontendnew.sh'
+                        }
+                    }
                 }
             }
         }
 
-        stage("OWASP: Dependency check"){
-            steps{
-                script{
-                    owasp_dependency()
+        stage('Build Backend Image') {
+            steps {
+                dir('backend') {
+                    sh """
+                    docker build -t ${BACKEND_REPO}:${params.BACKEND_DOCKER_TAG} .
+                    """
                 }
             }
         }
-        
-        stage("SonarQube: Code Analysis"){
-            steps{
-                script{
-                    sonarqube_analysis("Sonar","wanderlust","wanderlust")
+
+        stage('Build Frontend Image') {
+            steps {
+                dir('frontend') {
+                    sh """
+                    docker build -t ${FRONTEND_REPO}:${params.FRONTEND_DOCKER_TAG} .
+                    """
                 }
             }
         }
-        
-        stage("SonarQube: Code Quality Gates"){
-            steps{
-                script{
-                    sonarqube_code_quality()
-                }
+
+        stage('Login to Amazon ECR') {
+            steps {
+                sh """
+                aws ecr get-login-password --region ${AWS_REGION} | docker login \
+                --username AWS \
+                --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                """
             }
         }
-        
-        stage('Exporting environment variables') {
-            parallel{
-                stage("Backend env setup"){
-                    steps {
-                        script{
-                            dir("Automations"){
-                                sh "bash updatebackendnew.sh"
-                            }
-                        }
-                    }
-                }
-                
-                stage("Frontend env setup"){
-                    steps {
-                        script{
-                            dir("Automations"){
-                                sh "bash updatefrontendnew.sh"
-                            }
-                        }
-                    }
-                }
+
+        stage('Tag Docker Images') {
+            steps {
+                sh """
+                docker tag ${BACKEND_REPO}:${params.BACKEND_DOCKER_TAG} \
+                ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${BACKEND_REPO}:${params.BACKEND_DOCKER_TAG}
+
+                docker tag ${FRONTEND_REPO}:${params.FRONTEND_DOCKER_TAG} \
+                ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${FRONTEND_REPO}:${params.FRONTEND_DOCKER_TAG}
+                """
             }
         }
-        
-        stage("Docker: Build Images"){
-            steps{
-                script{
-                        dir('backend'){
-                            docker_build("wanderlust-backend-beta","${params.BACKEND_DOCKER_TAG}","trainwithshubham")
-                        }
-                    
-                        dir('frontend'){
-                            docker_build("wanderlust-frontend-beta","${params.FRONTEND_DOCKER_TAG}","trainwithshubham")
-                        }
-                }
+
+        stage('Push Images to Amazon ECR') {
+            steps {
+                sh """
+                docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${BACKEND_REPO}:${params.BACKEND_DOCKER_TAG}
+
+                docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${FRONTEND_REPO}:${params.FRONTEND_DOCKER_TAG}
+                """
             }
         }
-        
-        stage("Docker: Push to DockerHub"){
-            steps{
-                script{
-                    docker_push("wanderlust-backend-beta","${params.BACKEND_DOCKER_TAG}","trainwithshubham") 
-                    docker_push("wanderlust-frontend-beta","${params.FRONTEND_DOCKER_TAG}","trainwithshubham")
-                }
-            }
-        }
+
     }
-    post{
-        success{
-            archiveArtifacts artifacts: '*.xml', followSymlinks: false
-            build job: "Wanderlust-CD", parameters: [
-                string(name: 'FRONTEND_DOCKER_TAG', value: "${params.FRONTEND_DOCKER_TAG}"),
-                string(name: 'BACKEND_DOCKER_TAG', value: "${params.BACKEND_DOCKER_TAG}")
-            ]
+
+    post {
+
+        success {
+            echo "=================================="
+            echo "CI Pipeline Completed Successfully"
+            echo "=================================="
+        }
+
+        failure {
+            echo "=================================="
+            echo "CI Pipeline Failed"
+            echo "=================================="
         }
     }
 }
